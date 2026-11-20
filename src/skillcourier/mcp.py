@@ -17,9 +17,13 @@ import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import IO, Any, Literal
+from typing import IO, TYPE_CHECKING, Any, Literal
 
 from . import __version__
+from .oauth import Challenge, OAuthError, parse_www_authenticate
+
+if TYPE_CHECKING:
+    from .oauth import OAuthProvider
 
 PROTOCOL = "2026-07-28"
 LEGACY_PROTOCOL = "2025-11-25"
@@ -48,7 +52,11 @@ class TransportError(Exception):
 
 
 class AuthRequired(TransportError):
-    """HTTP 401/403. skillcourier sends configured headers but does not run OAuth flows."""
+    """HTTP 401/403 that neither a refresh nor a login resolved."""
+
+    def __init__(self, message: str, challenge: Challenge | None = None) -> None:
+        super().__init__(message)
+        self.challenge = challenge
 
 
 @dataclass
@@ -147,14 +155,52 @@ def parse_sse(raw: str, want_id: Any) -> JsonObj | None:
     return None
 
 
+def has_auth_header(headers: dict[str, str]) -> bool:
+    return any(k.lower() == "authorization" for k in headers)
+
+
 class _Http:
-    def __init__(self, url: str, headers: dict[str, str], timeout: float) -> None:
+    def __init__(
+        self, url: str, headers: dict[str, str], timeout: float, auth: OAuthProvider | None = None
+    ) -> None:
         self.url = url
         self.headers = headers
         self.timeout = timeout
+        # A configured Authorization header wins: the user chose static credentials.
+        self.auth = None if has_auth_header(headers) else auth
         self.session_id: str | None = None
 
     def post(self, body: JsonObj, extra: dict[str, str]) -> tuple[int, JsonObj | None]:
+        for _ in range(3):
+            token = self.auth.authorization() if self.auth is not None else None
+            status, raw, ctype, www = self._post_once(body, extra, token)
+            if status not in (401, 403):
+                return self._decode(body, status, raw, ctype)
+            challenge = parse_www_authenticate(www, status)
+            if self.auth is None:
+                break
+            try:
+                retry = self.auth.handle(challenge, sent_token=token is not None)
+            except OAuthError as e:
+                raise AuthRequired(f"{self.url}: OAuth login failed: {e}", challenge) from e
+            if not retry:
+                break
+        raise AuthRequired(self._auth_message(status, challenge), challenge)
+
+    def _auth_message(self, status: int, ch: Challenge) -> str:
+        if self.auth is None and has_auth_header(self.headers):
+            return f"{self.url} answered HTTP {status} to the configured Authorization header"
+        if status == 403 and ch.error != "insufficient_scope":
+            return f"{self.url} answered HTTP 403 (forbidden{': ' + ch.error if ch.error else ''})"
+        need = f" (needs scope {ch.scope})" if ch.scope else ""
+        return (
+            f"{self.url} needs an OAuth login{need}. Run `skillcourier auth login {self.url}` "
+            "once (it opens a browser), or set an Authorization header."
+        )
+
+    def _post_once(
+        self, body: JsonObj, extra: dict[str, str], token: str | None
+    ) -> tuple[int, bytes, str, str | None]:
         hdrs = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
@@ -162,27 +208,29 @@ class _Http:
             **self.headers,
             **extra,
         }
+        if token is not None:
+            hdrs["Authorization"] = token
         if self.session_id:
             hdrs["Mcp-Session-Id"] = self.session_id
         req = urllib.request.Request(
             self.url, data=json.dumps(body).encode("utf-8"), headers=hdrs, method="POST"
         )
+        www: str | None = None
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 status, ctype, raw = resp.status, resp.headers.get("Content-Type", ""), resp.read()
                 sid = resp.headers.get("Mcp-Session-Id")
         except urllib.error.HTTPError as e:
             status, ctype, raw = e.code, e.headers.get("Content-Type", ""), e.read()
+            www = e.headers.get("WWW-Authenticate")
             sid = None
         except (urllib.error.URLError, OSError, TimeoutError) as e:
             raise TransportError(f"cannot reach {self.url}: {e}") from e
         if sid:
             self.session_id = sid
-        if status in (401, 403):
-            raise AuthRequired(
-                f"{self.url} answered HTTP {status}. skillcourier does not run OAuth; put a token "
-                "in the server's `headers` (for example Authorization: Bearer ${TOKEN})."
-            )
+        return status, raw, ctype, www
+
+    def _decode(self, body: JsonObj, status: int, raw: bytes, ctype: str) -> tuple[int, JsonObj | None]:
         text = raw.decode("utf-8", errors="replace")
         if "id" not in body:
             return status, None
@@ -297,9 +345,12 @@ class _Stdio:
 class McpClient:
     """One connection to one server. Use as a context manager."""
 
-    def __init__(self, endpoint: Endpoint, timeout: float = 30.0) -> None:
+    def __init__(
+        self, endpoint: Endpoint, timeout: float = 30.0, auth: OAuthProvider | None = None
+    ) -> None:
         self.endpoint = endpoint
         self.timeout = timeout
+        self.auth = auth
         self.info: ServerInfo | None = None
         self._next_id = 0
         self._http: _Http | None = None
@@ -351,7 +402,7 @@ class McpClient:
         if ep.kind == "http":
             if not ep.url:
                 raise TransportError(f"server {ep.label!r} has no url")
-            self._http = _Http(ep.url, ep.headers, self.timeout)
+            self._http = _Http(ep.url, ep.headers, self.timeout, self.auth)
         else:
             if not ep.command:
                 raise TransportError(f"server {ep.label!r} has no command")

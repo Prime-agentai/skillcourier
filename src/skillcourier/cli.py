@@ -5,16 +5,20 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import os
 import shlex
 import shutil
 import sys
+import time
+import webbrowser
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-from . import __version__
+from . import __version__, oauth
 from .config import Discovered, discover, label_for_url, slug
-from .mcp import AuthRequired, Endpoint, McpClient, McpError, TransportError
+from .mcp import AuthRequired, Endpoint, McpClient, McpError, TransportError, has_auth_header
+from .oauth import OAuthError, OAuthProvider, TokenStore, canonical_resource, probe
 from .spec import SkillEntry, VerificationError, parse_entry, split_frontmatter
 from .store import (
     Lock,
@@ -80,8 +84,27 @@ def resolve_endpoint(args: argparse.Namespace, found: Discovered) -> Endpoint:
     raise CliError(f"no MCP server labelled {server!r} (configured: {known}). Pass a URL or --cmd.")
 
 
-def connect(ep: Endpoint, timeout: float) -> McpClient:
-    client = McpClient(ep, timeout=timeout)
+def interactive(args: argparse.Namespace) -> bool:
+    """May we open a browser for an OAuth login? Never in hook mode, CI or a pipe."""
+    if getattr(args, "hook", False) or getattr(args, "no_login", False):
+        return False
+    return sys.stdin.isatty() and sys.stderr.isatty()
+
+
+def make_auth(ep: Endpoint, args: argparse.Namespace, allow_login: bool = True) -> OAuthProvider | None:
+    """OAuth for HTTP servers without a configured Authorization header."""
+    if ep.kind != "http" or not ep.url or has_auth_header(ep.headers):
+        return None
+    return OAuthProvider(
+        ep.url,
+        interactive=allow_login and interactive(args),
+        announce=err,
+        timeout=args.timeout,
+    )
+
+
+def connect(ep: Endpoint, args: argparse.Namespace) -> McpClient:
+    client = McpClient(ep, timeout=args.timeout, auth=make_auth(ep, args))
     try:
         info = client.connect()
     except BaseException:
@@ -156,7 +179,7 @@ def cmd_servers(args: argparse.Namespace) -> int:
             row["missing_vars"] = found.missing_vars[label]
         if not args.no_probe:
             try:
-                with McpClient(ep, timeout=args.timeout) as c:
+                with McpClient(ep, timeout=args.timeout, auth=make_auth(ep, args, allow_login=False)) as c:
                     assert c.info is not None
                     row.update(era=c.info.era, skills=c.info.skills)
                     if c.info.skills:
@@ -189,7 +212,7 @@ def cmd_ls(args: argparse.Namespace) -> int:
     ep = resolve_endpoint(args, discover(args.cwd))
     target = resolve_target(args.to, args.cwd)
     lock = Lock(target)
-    with connect(ep, args.timeout) as client:
+    with connect(ep, args) as client:
         entries, bad = load_listing(client)
     counts = Counter(e.name for e in entries)
     locals_ = local_names([target, resolve_target("claude", args.cwd), resolve_target("claude-user", args.cwd)])
@@ -239,7 +262,7 @@ def cmd_ls(args: argparse.Namespace) -> int:
 
 def cmd_show(args: argparse.Namespace) -> int:
     ep = resolve_endpoint(args, discover(args.cwd))
-    with connect(ep, args.timeout) as client:
+    with connect(ep, args) as client:
         entries, _ = load_listing(client)
         (entry,) = select(entries, [args.skill], client)
         if entry.files is None:
@@ -273,7 +296,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     ep = resolve_endpoint(args, discover(args.cwd))
     target = resolve_target(args.to, args.cwd)
     lock = Lock(target)
-    with connect(ep, args.timeout) as client:
+    with connect(ep, args) as client:
         entries, bad = load_listing(client)
         counts = Counter(e.name for e in entries)
         if args.all:
@@ -361,11 +384,15 @@ def inspect(args: argparse.Namespace, lock: Lock) -> list[dict[str, Any]]:
         ep = next((e for n in names if (e := _endpoint_for(label, lock.skills[n], found))), None)
         client: McpClient | None = None
         problem = None
+        needs_login: str | None = None
         if ep is None:
             problem = f"server '{label}' is not configured here and the lockfile cannot reach it on its own"
         elif not getattr(args, "offline", False):
             try:
-                client = connect(ep, args.timeout)
+                client = connect(ep, args)
+            except AuthRequired as e:
+                problem = f"cannot reach '{label}': {e}"
+                needs_login = ep.url
             except (TransportError, McpError, CliError, OSError) as e:
                 problem = f"cannot reach '{label}': {e}"
         try:
@@ -374,6 +401,8 @@ def inspect(args: argparse.Namespace, lock: Lock) -> list[dict[str, Any]]:
                 row: dict[str, Any] = {"name": name, "origin": label, "uri": rec["uri"]}
                 lstate, lproblems = local_state(lock.target, name, rec)
                 row["local"] = lstate
+                if needs_login:
+                    row["needs_login"] = needs_login
                 if lproblems:
                     row["local_problems"] = lproblems
                 if client is None:
@@ -445,6 +474,9 @@ def cmd_check(args: argparse.Namespace) -> int:
         if bad:
             names = ", ".join(r["name"] for r in bad[:5]) + (" ..." if len(bad) > 5 else "")
             msg = f"skillcourier: {len(bad)} imported MCP skill(s) need attention ({names}). Run `skillcourier check`."
+            logins = sorted({str(r["needs_login"]) for r in bad if r.get("needs_login")})
+            if logins:
+                msg += " Log in first: " + "; ".join(f"`skillcourier auth login {u}`" for u in logins) + "."
             print(json.dumps({"systemMessage": msg}))
         return EXIT_OK
     rows = inspect(args, lock)
@@ -479,7 +511,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             out(describe_row(r) + "  (pass --restore to put back the pinned content)")
             status = EXIT_ATTENTION
             continue
-        with connect(ep, args.timeout) as client:
+        with connect(ep, args) as client:
             entry = r.get("_entry") or parse_entry(client.get_skill(rec["uri"]))
             fm, body, files = fetch_verified(client, entry)
             if r["upstream"] == "changed":
@@ -530,6 +562,91 @@ def cmd_remove(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _http_endpoint(args: argparse.Namespace) -> Endpoint:
+    ep = resolve_endpoint(args, discover(args.cwd))
+    if ep.kind != "http" or not ep.url:
+        raise CliError(f"{ep.label} is a stdio server; OAuth applies only to HTTP servers")
+    return ep
+
+
+def cmd_auth_login(args: argparse.Namespace) -> int:
+    ep = _http_endpoint(args)
+    assert ep.url is not None
+    if has_auth_header(ep.headers):
+        err(f"note: {ep.label} has a configured Authorization header, which skillcourier sends instead of OAuth tokens")
+    challenge = probe(ep.url, args.timeout)
+    if challenge is None and not args.force:
+        out(f"{ep.label} ({ep.url}) answered without asking for credentials; nothing to log in to (use --force to try anyway).")
+        return EXIT_OK
+    secret = None
+    if args.client_secret_env:
+        secret = os.environ.get(args.client_secret_env)
+        if not secret:
+            raise CliError(f"${args.client_secret_env} is empty")
+    rec = oauth.login(
+        ep.url,
+        challenge=challenge,
+        scope=args.scope,
+        client_id=args.client_id,
+        client_secret=secret,
+        port=args.port,
+        open_browser=None if args.no_browser else webbrowser.open,
+        announce=err,
+        wait_s=args.wait,
+        timeout=args.timeout,
+    )
+    out(f"Logged in to {ep.label} ({rec['resource']}) via {rec['issuer']}; scope: {rec['scope'] or '(default)'}.")
+    out(f"Tokens are stored in {TokenStore().path} (mode 0600) and sent only to {rec['resource']}.")
+    return EXIT_OK
+
+
+def _expiry(rec: dict[str, Any]) -> str:
+    exp = rec.get("expires_at")
+    if not isinstance(exp, (int, float)):
+        return "no expiry given"
+    left = int(exp - time.time())
+    if left <= 0:
+        return "expired" + (", will refresh" if rec.get("refresh_token") else ", needs login")
+    return f"expires in {left // 3600}h{left % 3600 // 60:02d}m"
+
+
+def cmd_auth_status(args: argparse.Namespace) -> int:
+    store = TokenStore()
+    recs = store.load()["resources"]
+    rows = [
+        {
+            "resource": url,
+            "issuer": r.get("issuer"),
+            "scope": r.get("scope"),
+            "refreshable": bool(r.get("refresh_token")),
+            "expires_at": r.get("expires_at"),
+            "client_id": (r.get("client") or {}).get("client_id"),
+        }
+        for url, r in sorted(recs.items())
+        if isinstance(r, dict)
+    ]
+    if args.json:
+        out(json.dumps({"file": str(store.path), "logins": rows}, indent=2))
+        return EXIT_OK
+    if not rows:
+        out(f"No OAuth logins stored ({store.path}).")
+        return EXIT_OK
+    for url, r in sorted(recs.items()):
+        out(f"{url}")
+        out(f"    issuer {r.get('issuer')}; scope {r.get('scope') or '(default)'}; {_expiry(r)}")
+    return EXIT_OK
+
+
+def cmd_auth_logout(args: argparse.Namespace) -> int:
+    ep = _http_endpoint(args)
+    assert ep.url is not None
+    if oauth.logout(ep.url, TokenStore(), timeout=args.timeout):
+        out(f"Logged out of {canonical_resource(ep.url)} (tokens deleted; revoked where the server supports it).")
+        return EXIT_OK
+    out(f"No stored login for {canonical_resource(ep.url)}.")
+    return EXIT_OK
+
+
 def cmd_dev_server(args: argparse.Namespace) -> int:
     from .devserver import SkillDirServer, make_http_server, serve_stdio
 
@@ -539,10 +656,18 @@ def cmd_dev_server(args: argparse.Namespace) -> int:
     era = "legacy" if args.legacy else "dual"
     server = SkillDirServer(root, era=era)  # type: ignore[arg-type]
     if args.http is None:
+        if args.oauth:
+            raise CliError("--oauth needs --http PORT")
         serve_stdio(server)
         return EXIT_OK
-    httpd = make_http_server(server, args.http)
-    err(f"serving {len(server.skills())} skills from {root} at http://127.0.0.1:{httpd.server_address[1]}/mcp")
+    mock = None
+    if args.oauth:
+        from .devserver import MockAuthServer
+
+        mock = MockAuthServer(scope=args.oauth_scope)
+    httpd = make_http_server(server, args.http, oauth=mock)
+    note = " behind a mock OAuth server (every login is auto-approved)" if mock else ""
+    err(f"serving {len(server.skills())} skills from {root} at http://127.0.0.1:{httpd.server_address[1]}/mcp{note}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -565,6 +690,7 @@ def build_parser() -> argparse.ArgumentParser:
     def common(sp: argparse.ArgumentParser, server: bool = False, target: bool = True) -> None:
         sp.add_argument("--cwd", type=Path, default=Path.cwd(), help="project directory (default: here)")
         sp.add_argument("--timeout", type=float, default=None, help="seconds per server request (default 30; 5 with --hook)")
+        sp.add_argument("--no-login", action="store_true", help="never open a browser for an OAuth login")
         if target:
             sp.add_argument(
                 "--to",
@@ -630,7 +756,28 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("dir")
     sp.add_argument("--http", type=int, help="serve Streamable HTTP on 127.0.0.1:PORT/mcp")
     sp.add_argument("--legacy", action="store_true", help="answer only the legacy initialize handshake")
+    sp.add_argument("--oauth", action="store_true", help="require OAuth (mock authorization server, auto-approves)")
+    sp.add_argument("--oauth-scope", default="skills:read", help="scope the mock server requires")
     sp.set_defaults(func=cmd_dev_server)
+
+    auth = sub.add_parser("auth", help="OAuth logins for HTTP servers that require them")
+    asub = auth.add_subparsers(dest="auth_command", required=True)
+    sp = asub.add_parser("login", help="log in to a server (authorization code + PKCE, opens a browser)")
+    common(sp, server=True, target=False)
+    sp.add_argument("--scope", help="scopes to request (default: what the server asks for)")
+    sp.add_argument("--client-id", help="a client registered with the provider (default: dynamic registration)")
+    sp.add_argument("--client-secret-env", metavar="VAR", help="read that client's secret from $VAR")
+    sp.add_argument("--port", type=int, default=0, help="loopback callback port (default: any free port)")
+    sp.add_argument("--no-browser", action="store_true", help="only print the login URL")
+    sp.add_argument("--wait", type=float, default=300.0, help="seconds to wait for the browser (default 300)")
+    sp.add_argument("--force", action="store_true", help="log in even if the server did not ask")
+    sp.set_defaults(func=cmd_auth_login)
+    sp = asub.add_parser("status", help="list stored logins (never prints tokens)")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_auth_status)
+    sp = asub.add_parser("logout", help="revoke and delete a stored login")
+    common(sp, server=True, target=False)
+    sp.set_defaults(func=cmd_auth_logout)
     return p
 
 
@@ -646,7 +793,9 @@ def main(argv: list[str] | None = None) -> int:
         getattr(args, list_dest).extend(extras)
     if hasattr(args, "cwd"):
         args.cwd = args.cwd.resolve()
-    if hasattr(args, "timeout") and args.timeout is None:
+    if not hasattr(args, "timeout"):
+        args.timeout = 30.0
+    if args.timeout is None:
         args.timeout = 5.0 if getattr(args, "hook", False) else 30.0
     if not hasattr(args, "names"):
         args.names = []
@@ -655,7 +804,7 @@ def main(argv: list[str] | None = None) -> int:
         return rc
     except AuthRequired as e:
         err(f"skillcourier: {e}")
-    except (CliError, VerificationError, TransportError, McpError) as e:
+    except (CliError, VerificationError, TransportError, McpError, OAuthError) as e:
         err(f"skillcourier: {e}")
     except KeyboardInterrupt:
         err("interrupted")

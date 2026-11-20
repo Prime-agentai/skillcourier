@@ -1,6 +1,6 @@
 # skillcourier
 
-**Your MCP servers already serve Agent Skills. Your agent can't load them. `skillcourier` imports them into Claude Code, Codex or any `SKILL.md` agent: each file is digest-verified, the skill is labelled with where it came from, and the approval is pinned in a lockfile and revoked if the server changes a single byte.**
+**Your MCP servers already serve Agent Skills. Your agent can't load them. `skillcourier` imports them into Claude Code, Codex or any `SKILL.md` agent: each file is digest-verified, the skill is labelled with where it came from, and the approval is pinned in a lockfile and revoked if the server changes a single byte. Public servers and OAuth-protected ones alike.**
 
 [![CI](https://github.com/Prime-agentai/skillcourier/actions/workflows/ci.yml/badge.svg)](https://github.com/Prime-agentai/skillcourier/actions/workflows/ci.yml)
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
@@ -47,6 +47,48 @@ Then keep the imports honest. Add this to `.claude/settings.json` to get a one-l
 { "hooks": { "SessionStart": [ { "hooks": [ { "type": "command", "command": "skillcourier check --hook" } ] } ] } }
 ```
 
+## Servers that need a login (OAuth 2.1)
+
+Most hosted skill servers are per-user. Cloudflare's, for example, answers `401` and points at its OAuth metadata. New in 0.2: `skillcourier` runs the [MCP authorization flow](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization) itself, with the standard library only.
+
+```console
+$ skillcourier ls https://mcp.cloudflare.com/mcp
+skillcourier: https://mcp.cloudflare.com/mcp needs an OAuth login (needs scope user:read account:read).
+Run `skillcourier auth login https://mcp.cloudflare.com/mcp` once (it opens a browser), or set an Authorization header.
+
+$ skillcourier auth login https://mcp.cloudflare.com/mcp
+Log in to Cloudflare API MCP Server in your browser:
+  https://mcp.cloudflare.com/authorize?response_type=code&client_id=…&code_challenge_method=S256&resource=https%3A%2F%2Fmcp.cloudflare.com%2Fmcp&scope=user%3Aread+account%3Aread
+```
+
+*(Real output on 2026-11-20 up to the browser step: discovery and dynamic client registration ran live against Cloudflare. The browser login itself needs a Cloudflare account and was not run here. See [Verified so far](#verified-so-far).)*
+
+```mermaid
+sequenceDiagram
+    participant C as skillcourier
+    participant R as MCP server
+    participant A as Authorization server
+    participant B as Your browser
+    C->>R: server/discover (no token)
+    R-->>C: 401 WWW-Authenticate: Bearer resource_metadata=…, scope=…
+    C->>R: GET protected resource metadata (RFC 9728)
+    Note over C: resource must equal the server URL
+    C->>A: GET AS metadata (RFC 8414 / OIDC)
+    Note over C: issuer must match · S256 required
+    C->>A: dynamic client registration (RFC 7591), once per issuer
+    C->>B: authorize URL: PKCE S256 · state · resource (RFC 8707)
+    B->>C: 127.0.0.1 loopback callback: code · state · iss (RFC 9207)
+    C->>A: token request: code + verifier + resource
+    A-->>C: access + refresh token, stored 0600, bound to this server URL
+    C->>R: skills/list with Bearer token; refresh on expiry or 401
+```
+
+- **Checked, not trusted:** metadata naming another resource, an issuer mismatch, no `S256`, a non-HTTPS endpoint (loopback excepted), a forged `state` and a wrong `iss` all abort the login.
+- **Tokens stay put.** One `0600` file (`~/.config/skillcourier/auth.json`, or `$SKILLCOURIER_AUTH_FILE`), keyed by canonical server URL. A token is only ever sent to the server it was issued for. Tokens never reach the lockfile, stdout or logs.
+- **Quiet afterwards.** It refreshes before expiry and on a `401`, and keeps rotated refresh tokens. A refused refresh token is deleted. `403 insufficient_scope` triggers a step-up login that keeps the scopes you already had.
+- **Never surprises a hook.** A browser opens only when stdin and stderr are a terminal. `check --hook`, CI, pipes and `--no-login` never prompt. They say which `auth login` to run instead.
+- `auth status` lists logins (never tokens). `auth logout` deletes them and revokes the refresh token when the server supports RFC 7009. A configured `Authorization` header always wins over OAuth. Pre-registered clients: `--client-id` and `--client-secret-env VAR`. Over SSH, pass `--port N` and forward that port.
+
 ## How it works
 
 ```mermaid
@@ -79,7 +121,9 @@ flowchart LR
 | `skillcourier check [--offline] [--hook] [--json]` | Exit 0 if every import matches its server and the disk; 1 if anything needs attention |
 | `skillcourier sync [--approve] [--restore]` | Restore missing skills (e.g. fresh clone with a committed lockfile); show and re-approve changed ones |
 | `skillcourier remove <name>...` | Delete imported skills (refuses anything it didn't import) |
-| `skillcourier dev-server <dir> [--http PORT]` | Serve your own skills folder over MCP to preview what an import will look like |
+| `skillcourier auth login <server>` | OAuth 2.1 login (PKCE, loopback redirect). `--scope`, `--client-id`, `--client-secret-env`, `--port`, `--no-browser` |
+| `skillcourier auth status [--json]` / `auth logout <server>` | Stored logins with scope and expiry (never tokens) / revoke and forget |
+| `skillcourier dev-server <dir> [--http PORT] [--oauth]` | Serve your own skills folder over MCP to preview what an import will look like. `--oauth` puts it behind a strict, auto-approving mock authorization server |
 
 `<server>` is a configured label (`hf`), a URL (`https://huggingface.co/mcp`, add `--header 'Authorization: Bearer …'` if needed), or a label plus `--cmd "<stdio command>"`. `--to` picks the target: `claude` (`./.claude/skills`, default), `claude-user` (`~/.claude/skills`), `agents` (`./.agents/skills`), `agents-user` (`~/.agents/skills`), or any directory your agent reads skills from.
 
@@ -109,16 +153,20 @@ flowchart LR
 
 ## Verified so far
 
-- `scripts/check.sh` is the single gate: `mypy --strict`, 71 pytest tests, and an end-to-end CLI scenario against the dev server over stdio (import, refusal without approval, upstream change → revoked → diff → re-approve, local tamper → detect → restore, remove).
+- `scripts/check.sh` is the single gate: `mypy --strict`, 94 pytest tests, and an end-to-end CLI scenario against the dev server over stdio (import, refusal without approval, upstream change → revoked → diff → re-approve, local tamper → detect → restore, remove).
 - The tests run both transports (stdio and HTTP, JSON and SSE responses) and both protocol eras (modern and legacy), with header validation on every HTTP request. Tamper cases: wrong digest, wrong size, lying frontmatter, traversal URIs, case collisions, dynamic and malformed entries, a label re-pointed at a new server, and secrets kept out of the lockfile.
 - **Live interop:** `SKILLCOURIER_LIVE=1 scripts/check.sh` imports from `https://huggingface.co/mcp` (protocol 2026-07-28, 25 skills). In development, 3 skills / 39 files were verified end to end. The other 15+ servers on the implementations list are untested here.
+- **OAuth, offline:** 23 of those tests run the whole flow over real sockets against the dev server's mock authorization server, with a scripted browser. They cover login → import, the token file mode, tokens kept out of lockfile and output, expiry handled both ways (client clock and server `401`), refresh rotation, a dead refresh token, step-up on `insufficient_scope`, no token sent to a second server, client reuse, hook mode never opening a browser, logout + revocation, and every refusal: forged `state`, wrong `iss`, metadata for another resource, no `S256`, an access-denied callback and a timeout.
+- **OAuth, live (2026-11-20):** against `https://mcp.cloudflare.com/mcp`, the `401` challenge, resource metadata, AS metadata (S256 present) and dynamic client registration all worked, and an authorize URL was issued. Cloudflare's `/authorize` refuses non-browser clients (error 1010), so that leg needs a real browser. The browser login and token exchange have **not** been run against a real provider yet.
 - CI: Ubuntu + macOS × Python 3.11 / 3.12 / 3.13, plus a uv quickstart job.
 
-Not verified: Windows; OAuth-only servers (send a token via `headers`); servers on legacy SSE transport (unsupported).
+Not verified: Windows; a completed OAuth login with a real provider (see above); servers on legacy SSE transport (unsupported).
 
 ## Roadmap
 
-- [ ] OAuth 2.1 for HTTP servers that need it (today: static headers, `${VAR}` expanded)
+- [x] OAuth 2.1 for HTTP servers that need it (0.2.0)
+- [ ] Client ID Metadata Documents (CIMD) as the preferred client identity where the server supports it
+- [ ] OS keychain token storage (today: a 0600 file)
 - [ ] `--from-lock` bootstrap for CI without configured servers (works today for URL and `--cmd` origins)
 - [ ] Policy file: allow/deny servers and skills, require `--grant-tools` review in CI
 - [ ] Opt-in support for `dynamic` skills, re-verified on every `check`
