@@ -1,0 +1,51 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Check (types, tests, CLI end to end)
+        shell: bash
+        env:
+          PYTHON: python
+          PYTHONUTF8: "1"
+        run: uv run --python ${{ matrix.python }} --no-project --with pyyaml --with types-pyyaml --with pytest --with mypy bash scripts/check.sh
+
+  quickstart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install as a tool and import from the bundled dev server
+        shell: bash
+        run: |
+          uv tool install .
+          cd "$(mktemp -d)"
+          skillcourier --version
+          skillcourier add demo --cmd "skillcourier dev-server $GITHUB_WORKSPACE/examples/skills" release-notes --yes
+          skillcourier check
+
+  live-interop:
+    # Talks to https://huggingface.co/mcp. Informational: an outage there must not block main.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Import real skills from Hugging Face
+        shell: bash
+        env:
+          PYTHON: python
+          SKILLCOURIER_LIVE: "1"
+        run: uv run --no-project --with pyyaml --with types-pyyaml --with pytest --with mypy bash scripts/check.sh
