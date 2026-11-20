@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skillcourier"
+version = "0.1.0"
+description = "Import the Agent Skills your MCP servers serve (SEP-2640) into Claude Code, Codex or any SKILL.md agent: digest-verified, origin-labelled, pinned in a lockfile."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Prime-agentai" }]
+keywords = ["mcp", "model-context-protocol", "agent-skills", "claude-code", "codex", "skills", "sep-2640", "supply-chain", "lockfile", "ai-agents"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development",
+  "Topic :: Security",
+  "Typing :: Typed",
+]
+dependencies = ["PyYAML>=6.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "mypy>=1.8", "types-PyYAML"]
+
+[project.scripts]
+skillcourier = "skillcourier.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Prime-agentai/skillcourier"
+Issues = "https://github.com/Prime-agentai/skillcourier/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+skillcourier = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+
+[tool.mypy]
+strict = true
+files = ["src"]
